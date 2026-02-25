@@ -167,7 +167,9 @@ function scheduleDailyCleanup() {
       now.getFullYear(),
       now.getMonth(),
       now.getDate() + 1,
-      0, 0, 0,
+      0,
+      0,
+      0,
     );
     return next.getTime() - now.getTime();
   }
