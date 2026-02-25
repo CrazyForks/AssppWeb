@@ -92,83 +92,92 @@ function persistTasks() {
   fs.writeFileSync(TASKS_FILE, JSON.stringify(completed, null, 2));
 }
 
-// --- Auto Cleanup Module (Environment Variable Driven) ---
-// Time-based cleanup: Delete files older than configured days
-// 按时间清理：删除超过环境变量设定天数的文件
+// Auto-cleanup: delete completed files older than configured days
 export function runTimeCleanup() {
   const { autoCleanupDays } = config;
   if (autoCleanupDays <= 0) return;
   const cutoff = Date.now() - autoCleanupDays * 24 * 60 * 60 * 1000;
 
+  // Collect IDs first to avoid mutating the map during iteration
+  const expiredIds: string[] = [];
   for (const task of tasks.values()) {
-    if (task.status === "completed" && task.filePath && fs.existsSync(task.filePath)) {
+    if (
+      task.status === "completed" &&
+      task.filePath &&
+      fs.existsSync(task.filePath)
+    ) {
       try {
         const stat = fs.statSync(task.filePath);
         if (stat.mtimeMs < cutoff) {
-          console.log(`[Cleanup] Deleting expired file: ${task.filePath}`);
-          deleteTask(task.id);
+          expiredIds.push(task.id);
         }
-      } catch (e) {
-        console.error(`[Cleanup] Error stat file ${task.filePath}:`, e);
+      } catch {
+        // File inaccessible — skip
       }
     }
   }
+
+  for (const id of expiredIds) {
+    console.log(`[Cleanup] Deleting expired task: ${id}`);
+    deleteTask(id);
+  }
 }
 
-// Space-based cleanup: Delete oldest files until size is below configured threshold
-// 按空间清理：如果总占用超出环境变量设定的最大空间，则按时间从老到新依次删除
+// Auto-cleanup: evict oldest completed files when total size exceeds limit
 export function runSpaceCleanup() {
   const { autoCleanupMaxMB } = config;
   if (autoCleanupMaxMB <= 0) return;
   const maxBytes = autoCleanupMaxMB * 1024 * 1024;
 
   let totalBytes = 0;
-  const fileTasks: { task: DownloadTask; size: number; mtimeMs: number }[] = [];
+  const fileTasks: { id: string; size: number; mtimeMs: number }[] = [];
 
-  // Calculate total size of completed tasks
-  // 计算所有已完成任务的总体积
   for (const task of tasks.values()) {
-    if (task.status === "completed" && task.filePath && fs.existsSync(task.filePath)) {
+    if (
+      task.status === "completed" &&
+      task.filePath &&
+      fs.existsSync(task.filePath)
+    ) {
       try {
         const stat = fs.statSync(task.filePath);
         totalBytes += stat.size;
-        fileTasks.push({ task, size: stat.size, mtimeMs: stat.mtimeMs });
-      } catch (e) {
-        console.error(`[Cleanup] Error stat file ${task.filePath}:`, e);
+        fileTasks.push({ id: task.id, size: stat.size, mtimeMs: stat.mtimeMs });
+      } catch {
+        // File inaccessible — skip
       }
     }
   }
 
-  // Delete oldest files if total size exceeds limit
-  // 超过体积限制则开始删除最老的文件
-  if (totalBytes > maxBytes) {
-    fileTasks.sort((a, b) => a.mtimeMs - b.mtimeMs);
-    for (const ft of fileTasks) {
-      console.log(`[Cleanup] Space exceeded. Deleting oldest file: ${ft.task.filePath}`);
-      deleteTask(ft.task.id);
-      totalBytes -= ft.size;
-      if (totalBytes <= maxBytes) break;
-    }
+  if (totalBytes <= maxBytes) return;
+
+  fileTasks.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  for (const ft of fileTasks) {
+    console.log(`[Cleanup] Space limit exceeded, deleting task: ${ft.id}`);
+    deleteTask(ft.id);
+    totalBytes -= ft.size;
+    if (totalBytes <= maxBytes) break;
   }
 }
 
-// Schedule the daily 0:00 AM cron job
-// 安排每日午夜0点执行定时清理任务
-function scheduleMidnightTask() {
-  const now = new Date();
-  const nextMidnight = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate() + 1,
-    0, 0, 0
-  );
-  const timeToMidnight = nextMidnight.getTime() - now.getTime();
+// Schedule daily time-based cleanup at midnight (self-correcting to avoid drift)
+function scheduleDailyCleanup() {
+  function msUntilMidnight(): number {
+    const now = new Date();
+    const next = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      0, 0, 0,
+    );
+    return next.getTime() - now.getTime();
+  }
 
-  setTimeout(() => {
+  function tick() {
     runTimeCleanup();
-    // Schedule next execution 24 hours later
-    setInterval(runTimeCleanup, 24 * 60 * 60 * 1000);
-  }, timeToMidnight);
+    setTimeout(tick, msUntilMidnight());
+  }
+
+  setTimeout(tick, msUntilMidnight());
 }
 
 function initOnStartup() {
@@ -217,10 +226,9 @@ function initOnStartup() {
   // Clean up orphaned IPA files (files without a task)
   cleanOrphanedPackages();
 
-  // --- Initialize Auto Cleanup ---
-  // 初始化环境配置下的自动清理
-  runTimeCleanup(); // Run once on start
-  scheduleMidnightTask(); // Schedule cron
+  // Run time-based cleanup once on startup, then schedule daily
+  runTimeCleanup();
+  scheduleDailyCleanup();
 }
 
 function cleanOrphanedPackages() {
@@ -397,8 +405,7 @@ export function createTask(
 }
 
 async function startDownload(task: DownloadTask) {
-  // --- Auto Cleanup Hook Before Download ---
-  // 下载前触发一次空间和时间清理检查
+  // Pre-download cleanup: expire old files + enforce space limit
   runTimeCleanup();
   runSpaceCleanup();
 
